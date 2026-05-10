@@ -97,6 +97,11 @@ fi
 WORKDIR=$(pwd)
 ARCH=$(uname -m)
 
+# Keep user-site packages out of this install. Packages from
+# ~/.local/lib/pythonX.Y/site-packages can silently override conda packages and
+# caused NumPy/SciPy ABI import failures during OmniGibson startup.
+export PYTHONNOUSERSITE=1
+
 # Check conda environment condition early (unless creating new environment)
 if [ "$NEW_ENV" = false ]; then
     if [ -z "$CONDA_PREFIX" ]; then
@@ -266,9 +271,10 @@ pip install torch==2.7.0 torchvision==0.22.0 torchaudio==2.7.0 --index-url https
 
 echo "✓ PyTorch installation completed"
 
-# Install numpy <2 to avoid conflicts
-echo "Installing numpy..."
-pip install "numpy<2"
+# Keep NumPy on the 1.x stack for OmniGibson/Isaac Sim, and let pip resolve a
+# SciPy wheel that is compatible with the selected NumPy version.
+echo "Installing numpy and scipy..."
+pip install "numpy<2" scipy
 
 # Install BDDL
 if [ "$BDDL" = true ]; then
@@ -496,6 +502,12 @@ if [ "$DATASET" = true ]; then
         echo "ERROR: 2025 BEHAVIOR Challenge Task Instances installation failed"
         exit 1
     }
+fi
+
+echo "Checking Python package consistency..."
+if ! pip check; then
+    echo "WARNING: pip check reported package metadata conflicts."
+    echo "Continuing because Isaac Sim environments commonly carry intentional pinned-package overrides."
 fi
 
 echo ""
