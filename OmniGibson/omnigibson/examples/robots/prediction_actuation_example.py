@@ -37,6 +37,12 @@ class Prediction:
     trajectory_camera: np.ndarray
 
 
+@dataclass
+class ArmLinkGuardState:
+    active: bool = False
+    steps: int = 0
+
+
 class PredictionKeyHandler:
     """
     Keyboard sequence handler for E + digit prediction execution.
@@ -339,6 +345,25 @@ def arm_links_ahead_of_gripper(robot, arm, margin):
     return sorted(violations, key=lambda item: item[2], reverse=True)
 
 
+def update_arm_link_guard_state(robot, arm, margin, activation_steps, guard_state):
+    if guard_state is None:
+        return True
+
+    guard_state.steps += 1
+    if guard_state.active:
+        return True
+
+    if guard_state.steps < activation_steps:
+        return False
+
+    if not arm_links_ahead_of_gripper(robot, arm, margin):
+        guard_state.active = True
+        print("Stage: arm-link-behind-gripper guard is now active.")
+        return True
+
+    return False
+
+
 def format_link_violations(violations):
     preview = [f"{path} x={link_x:.3f} excess={excess:.3f}" for path, link_x, excess in violations[:3]]
     suffix = "" if len(violations) <= len(preview) else f" and {len(violations) - len(preview)} more"
@@ -399,6 +424,8 @@ def step_toward(
     check_contacts=False,
     keep_arm_links_behind_gripper=True,
     arm_link_behind_gripper_margin=0.0,
+    arm_link_guard_activation_steps=0,
+    arm_link_guard_state=None,
     target_is_tcp=True,
 ):
     target = th.tensor(target_robot, dtype=th.float32)
@@ -437,11 +464,19 @@ def step_toward(
     robot.apply_action(action)
     og.sim.step()
     if keep_arm_links_behind_gripper:
-        link_violations = arm_links_ahead_of_gripper(robot, arm, arm_link_behind_gripper_margin)
-        if link_violations:
-            robot.set_joint_positions(previous_joint_positions, drive=False)
-            og.sim.step()
-            return distance, [], link_violations
+        guard_is_active = update_arm_link_guard_state(
+            robot=robot,
+            arm=arm,
+            margin=arm_link_behind_gripper_margin,
+            activation_steps=arm_link_guard_activation_steps,
+            guard_state=arm_link_guard_state,
+        )
+        if guard_is_active:
+            link_violations = arm_links_ahead_of_gripper(robot, arm, arm_link_behind_gripper_margin)
+            if link_violations:
+                robot.set_joint_positions(previous_joint_positions, drive=False)
+                og.sim.step()
+                return distance, [], link_violations
     return distance, get_end_effector_contacts(robot, arm) if check_contacts else [], []
 
 
@@ -455,6 +490,8 @@ def drive_to_waypoint(
     stop_on_contact=False,
     target_is_tcp=True,
     key_handler=None,
+    use_arm_link_guard=True,
+    arm_link_guard_state=None,
 ):
     for _ in range(args.max_steps_per_waypoint):
         if key_handler is not None and key_handler.reset_requested:
@@ -467,8 +504,10 @@ def drive_to_waypoint(
             gripper_command=gripper_command,
             target_orientation_robot=target_orientation_robot,
             check_contacts=stop_on_contact,
-            keep_arm_links_behind_gripper=args.keep_arm_links_behind_gripper,
+            keep_arm_links_behind_gripper=args.keep_arm_links_behind_gripper and use_arm_link_guard,
             arm_link_behind_gripper_margin=args.arm_link_behind_gripper_margin,
+            arm_link_guard_activation_steps=args.arm_link_guard_activation_steps,
+            arm_link_guard_state=arm_link_guard_state,
             target_is_tcp=target_is_tcp,
         )
         if link_violations:
@@ -492,6 +531,7 @@ def execute_prediction(robot, arm, prediction, trajectory_robot, args, key_handl
         print("Stage: open gripper skipped; no --open-gripper-command provided.")
     else:
         print("Stage: open gripper command active while moving to first waypoint.")
+    arm_link_guard_state = ArmLinkGuardState()
 
     first_waypoint = trajectory_robot[0]
     print("Stage: moving gripper TCP to first waypoint.")
@@ -503,6 +543,7 @@ def execute_prediction(robot, arm, prediction, trajectory_robot, args, key_handl
         gripper_command=args.open_gripper_command,
         stop_on_contact=True,
         key_handler=key_handler,
+        arm_link_guard_state=arm_link_guard_state,
     )
     if status == "reset":
         print("Reset requested; interrupting prediction before first waypoint completion.")
@@ -590,6 +631,7 @@ def execute_prediction(robot, arm, prediction, trajectory_robot, args, key_handl
             gripper_command=args.close_gripper_command,
             stop_on_contact=False,
             key_handler=key_handler,
+            arm_link_guard_state=arm_link_guard_state,
         )
         if status == "reset":
             print("Reset requested; interrupting prediction during recovery waypoint.")
@@ -643,6 +685,7 @@ def execute_prediction(robot, arm, prediction, trajectory_robot, args, key_handl
             gripper_command=args.close_gripper_command,
             stop_on_contact=False,
             key_handler=key_handler,
+            arm_link_guard_state=arm_link_guard_state,
         )
         if status == "reset":
             print("Reset requested; interrupting prediction while following trajectory.")
@@ -669,6 +712,7 @@ def reset_arm_to_home(robot, arm, home_position_robot, home_orientation_robot, a
         gripper_command=args.open_gripper_command,
         target_orientation_robot=home_orientation_robot,
         target_is_tcp=False,
+        use_arm_link_guard=False,
     )
     if status == "reached":
         print("Arm reset finished.")
@@ -756,6 +800,12 @@ def main():
         type=float,
         default=0.0,
         help="Required robot-frame x margin, in meters, for arm links to remain behind the gripper TCP.",
+    )
+    parser.add_argument(
+        "--arm-link-guard-activation-steps",
+        type=int,
+        default=10,
+        help="Minimum IK steps before enabling the arm-link-behind-gripper guard once the gripper is leading.",
     )
     parser.add_argument(
         "--waypoint-stride",
