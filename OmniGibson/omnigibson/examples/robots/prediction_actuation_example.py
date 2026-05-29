@@ -419,6 +419,7 @@ def execute_prediction(robot, arm, prediction, trajectory_robot, args):
         stop_on_contact=True,
     )
     next_waypoint_index = 1
+    recovery_waypoint_index = None
     if status == "reached":
         print("Stage: moved end effector to first waypoint.")
     else:
@@ -449,22 +450,10 @@ def execute_prediction(robot, arm, prediction, trajectory_robot, args):
             )
             next_waypoint_index = len(trajectory_robot)
         elif closest_index > 0 and closest_distance > args.position_tolerance:
-            print(f"Stage: moving end effector to closest available waypoint {closest_index}.")
-            status, contact_paths = drive_to_waypoint(
-                robot,
-                arm,
-                trajectory_robot[closest_index],
-                args,
-                gripper_command=args.open_gripper_command,
-                stop_on_contact=False,
+            recovery_waypoint_index = closest_index
+            print(
+                f"Stage: closest available waypoint {closest_index} will be executed after close gripper."
             )
-            if status == "reached":
-                print(f"Stage: moved end effector to closest available waypoint {closest_index}.")
-            else:
-                print(
-                    f"Warning: closest available waypoint {closest_index} was not reached; "
-                    "continuing from the current end effector pose."
-                )
         else:
             print("Stage: continuing from the current end effector pose.")
         if has_safe_x_candidate:
@@ -479,6 +468,24 @@ def execute_prediction(robot, arm, prediction, trajectory_robot, args):
             og.sim.step()
     else:
         print("Stage: close gripper skipped; no --close-gripper-command provided.")
+
+    if recovery_waypoint_index is not None:
+        print(f"Stage: moving end effector to closest available waypoint {recovery_waypoint_index}.")
+        status, contact_paths = drive_to_waypoint(
+            robot,
+            arm,
+            trajectory_robot[recovery_waypoint_index],
+            args,
+            gripper_command=args.close_gripper_command,
+            stop_on_contact=False,
+        )
+        if status == "reached":
+            print(f"Stage: moved end effector to closest available waypoint {recovery_waypoint_index}.")
+        else:
+            print(
+                f"Warning: closest available waypoint {recovery_waypoint_index} was not reached; "
+                "continuing from the current end effector pose."
+            )
 
     if next_waypoint_index >= len(trajectory_robot):
         print("Stage: no remaining waypoints after closest available point.")
