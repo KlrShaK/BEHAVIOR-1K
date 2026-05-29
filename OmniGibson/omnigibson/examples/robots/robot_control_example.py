@@ -17,6 +17,7 @@ import omnigibson.lazy as lazy
 from omnigibson.macros import gm
 from omnigibson.robots import REGISTERED_ROBOTS
 from omnigibson.sensors import VisionSensor
+import omnigibson.utils.transform_utils as T
 from omnigibson.utils.ui_utils import KeyboardRobotController, choose_from_options
 
 CONTROL_MODES = dict(
@@ -65,12 +66,113 @@ def next_capture_idx(output_root):
     return max(existing, default=0) + 1
 
 
-def capture_camera_observation(camera, output_root, capture_idx, resolution=CAPTURE_RESOLUTION):
+def to_jsonable(value):
+    """
+    Converts tensors / numpy values to JSON-serializable Python values.
+    """
+    if isinstance(value, th.Tensor):
+        return value.detach().cpu().tolist()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, dict):
+        return {str(k): to_jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [to_jsonable(v) for v in value]
+    return value
+
+
+def pose_metadata(position, orientation, reference_frame="world"):
+    """
+    Serializes a pose as position, xyzw quaternion, and homogeneous transform.
+    """
+    return {
+        "reference_frame": reference_frame,
+        "position": to_jsonable(position),
+        "orientation_xyzw": to_jsonable(orientation),
+        "T_reference_frame": to_jsonable(T.pose2mat((position, orientation))),
+    }
+
+
+def build_capture_metadata(robot, camera, camera_name, capture_idx, step, intrinsics, resolution):
+    """
+    Builds frame metadata needed to transform camera-frame predictions into world / robot frames.
+    """
+    robot_pos, robot_orn = robot.get_position_orientation()
+    camera_pos, camera_orn = camera.get_position_orientation()
+    robot_pose = pose_metadata(robot_pos, robot_orn)
+    camera_pose = pose_metadata(camera_pos, camera_orn)
+    joint_names = list(robot.joints.keys())
+    joint_positions = robot.get_joint_positions()
+
+    metadata = {
+        "capture_idx": int(capture_idx),
+        "sim_step": int(step),
+        "wall_time_unix": time.time(),
+        "coordinate_conventions": {
+            "quaternion_order": "xyzw",
+            "pose_reference_frame": "see each pose reference_frame field",
+            "transform_key": "T_reference_frame",
+            "depth_units": "meters",
+        },
+        "camera": {
+            "name": camera_name,
+            "prim_path": camera.prim_path,
+            "modalities": sorted(camera.modalities),
+            "image_width": int(camera.image_width),
+            "image_height": int(camera.image_height),
+            "expected_resolution": list(resolution),
+            "intrinsic_matrix": to_jsonable(intrinsics),
+            "pose": camera_pose,
+            "T_world_camera": camera_pose["T_reference_frame"],
+        },
+        "robot": {
+            "name": robot.name,
+            "model": robot.model,
+            "prim_path": robot.prim_path,
+            "pose": robot_pose,
+            "T_world_robot": robot_pose["T_reference_frame"],
+            "joint_positions": {
+                joint_name: to_jsonable(joint_positions[i]) for i, joint_name in enumerate(joint_names)
+            },
+        },
+    }
+
+    if robot.is_manipulation:
+        metadata["robot"]["default_arm"] = robot.default_arm
+        metadata["robot"]["eef_poses"] = {}
+        for arm in robot.arm_names:
+            eef_pos, eef_orn = robot.get_eef_pose(arm=arm)
+            rel_eef_pos, rel_eef_orn = robot.get_relative_eef_pose(arm=arm)
+            eef_pose = pose_metadata(eef_pos, eef_orn)
+            rel_eef_pose = pose_metadata(rel_eef_pos, rel_eef_orn, reference_frame="robot")
+            metadata["robot"]["eef_poses"][arm] = {
+                "link_name": robot.eef_link_names[arm],
+                "world": eef_pose,
+                "robot_relative": rel_eef_pose,
+                "T_world_eef": eef_pose["T_reference_frame"],
+                "T_robot_eef": rel_eef_pose["T_reference_frame"],
+            }
+
+    return metadata
+
+
+def capture_camera_observation(
+    camera,
+    camera_name,
+    robot,
+    output_root,
+    capture_idx,
+    step,
+    resolution=CAPTURE_RESOLUTION,
+):
     """
     Captures RGB, depth, and intrinsics from @camera into:
         omnigibson_<idx>/colour/<idx>.png
         omnigibson_<idx>/depth/<idx>.png
         omnigibson_<idx>/camera_intrinsic.json
+        omnigibson_<idx>/metadata.json
     """
     capture_dir = output_root / f"omnigibson_{capture_idx}"
     colour_dir = capture_dir / "colour"
@@ -111,6 +213,18 @@ def capture_camera_observation(camera, output_root, capture_idx, resolution=CAPT
     }
     with (capture_dir / "camera_intrinsic.json").open("w") as f:
         json.dump(intrinsics, f, indent=2)
+
+    metadata = build_capture_metadata(
+        robot=robot,
+        camera=camera,
+        camera_name=camera_name,
+        capture_idx=capture_idx,
+        step=step,
+        intrinsics=K,
+        resolution=resolution,
+    )
+    with (capture_dir / "metadata.json").open("w") as f:
+        json.dump(metadata, f, indent=2)
 
     print(f"Saved RGB-D capture {capture_idx} to {capture_dir}")
 
@@ -239,6 +353,7 @@ def main(random_selection=False, headless=False, short_exec=False, quickstart=Fa
 
     capture_enabled = control_mode == "teleop"
     capture_output_root = None
+    capture_camera_name = None
     capture_camera = None
     capture_idx = 1
     capture_requested = False
@@ -310,8 +425,11 @@ def main(random_selection=False, headless=False, short_exec=False, quickstart=Fa
                 capture_idx = max(capture_idx, next_capture_idx(capture_output_root))
                 capture_camera_observation(
                     camera=capture_camera,
+                    camera_name=capture_camera_name,
+                    robot=robot,
                     output_root=capture_output_root,
                     capture_idx=capture_idx,
+                    step=step,
                 )
                 capture_idx += 1
             except Exception as e:
