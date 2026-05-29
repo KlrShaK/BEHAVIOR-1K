@@ -303,19 +303,32 @@ def current_eef_position(robot, arm):
     return robot.get_relative_eef_position(arm=arm).detach().cpu().numpy()
 
 
-def closest_trajectory_index(robot, arm, trajectory_robot, prefer_behind_x=False):
+def closest_trajectory_index(robot, arm, trajectory_robot, recovery_x_clearance=0.0):
     current = current_eef_position(robot, arm)
     candidate_indices = np.arange(len(trajectory_robot))
-    if prefer_behind_x:
+    has_safe_x_candidate = False
+    if recovery_x_clearance > 0.0:
+        target_x = current[0] - recovery_x_clearance
+        behind_mask = trajectory_robot[:, 0] <= target_x
+        if np.any(behind_mask):
+            candidate_indices = candidate_indices[behind_mask]
+            has_safe_x_candidate = True
+        else:
+            behind_mask = trajectory_robot[:, 0] <= current[0]
+            if np.any(behind_mask):
+                candidate_indices = candidate_indices[behind_mask]
+                has_safe_x_candidate = True
+    else:
         behind_mask = trajectory_robot[:, 0] <= current[0]
         if np.any(behind_mask):
             candidate_indices = candidate_indices[behind_mask]
+            has_safe_x_candidate = True
 
     candidate_points = trajectory_robot[candidate_indices]
     distances = np.linalg.norm(candidate_points - current, axis=1)
     closest_candidate = int(np.argmin(distances))
     closest_index = int(candidate_indices[closest_candidate])
-    return closest_index, float(distances[closest_candidate]), current
+    return closest_index, float(distances[closest_candidate]), current, has_safe_x_candidate
 
 
 def step_toward(
@@ -417,18 +430,25 @@ def execute_prediction(robot, arm, prediction, trajectory_robot, args):
             print("Stage: contact checks disabled after approach; contact is expected during drawer actuation.")
         else:
             print("Warning: did not reach the first prediction waypoint within the step budget.")
-        closest_index, closest_distance, current_position = closest_trajectory_index(
+        closest_index, closest_distance, current_position, has_safe_x_candidate = closest_trajectory_index(
             robot,
             arm,
             trajectory_robot,
-            prefer_behind_x=True,
+            recovery_x_clearance=args.approach_recovery_x_clearance,
         )
         print(
             f"Stage: first waypoint not reached; closest available trajectory waypoint is "
             f"{closest_index} ({closest_distance:.3f} m away, current x={current_position[0]:.3f}, "
-            f"waypoint x={trajectory_robot[closest_index, 0]:.3f})."
+            f"waypoint x={trajectory_robot[closest_index, 0]:.3f}, "
+            f"required x<={current_position[0] - args.approach_recovery_x_clearance:.3f})."
         )
-        if closest_index > 0 and closest_distance > args.position_tolerance:
+        if not has_safe_x_candidate:
+            print(
+                "Warning: no trajectory waypoint is behind the current end effector x; "
+                "skipping recovery move to avoid pushing into the cabinet."
+            )
+            next_waypoint_index = len(trajectory_robot)
+        elif closest_index > 0 and closest_distance > args.position_tolerance:
             print(f"Stage: moving end effector to closest available waypoint {closest_index}.")
             status, contact_paths = drive_to_waypoint(
                 robot,
@@ -447,7 +467,8 @@ def execute_prediction(robot, arm, prediction, trajectory_robot, args):
                 )
         else:
             print("Stage: continuing from the current end effector pose.")
-        next_waypoint_index = min(closest_index + 1, len(trajectory_robot))
+        if has_safe_x_candidate:
+            next_waypoint_index = min(closest_index + 1, len(trajectory_robot))
 
     if args.close_gripper_command is not None:
         print("Stage: close gripper.")
@@ -468,6 +489,13 @@ def execute_prediction(robot, arm, prediction, trajectory_robot, args):
         )
 
     for waypoint in trajectory_robot[next_waypoint_index :: args.waypoint_stride]:
+        current_position = current_eef_position(robot, arm)
+        if waypoint[0] > current_position[0] + args.max_forward_x_after_approach:
+            print(
+                f"Stage: skipping waypoint at x={waypoint[0]:.3f}; current x={current_position[0]:.3f} "
+                "and moving further into the cabinet is disabled after approach."
+            )
+            continue
         status, contact_paths = drive_to_waypoint(
             robot,
             arm,
@@ -537,6 +565,18 @@ def main():
         help="Waypoint tolerance in robot-frame meters.",
     )
     parser.add_argument("--max-steps-per-waypoint", type=int, default=80)
+    parser.add_argument(
+        "--approach-recovery-x-clearance",
+        type=float,
+        default=0.05,
+        help="Minimum robot-frame x retreat, in meters, when resuming after failed first-waypoint approach.",
+    )
+    parser.add_argument(
+        "--max-forward-x-after-approach",
+        type=float,
+        default=0.0,
+        help="Allowed robot-frame x increase after approach recovery; 0 prevents pushing farther into the cabinet.",
+    )
     parser.add_argument(
         "--waypoint-stride",
         type=int,
