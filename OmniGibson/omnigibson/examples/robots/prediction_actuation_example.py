@@ -293,6 +293,17 @@ def format_contact_paths(contact_paths):
     return ", ".join(preview) + suffix
 
 
+def current_eef_position(robot, arm):
+    return robot.get_relative_eef_position(arm=arm).detach().cpu().numpy()
+
+
+def closest_trajectory_index(robot, arm, trajectory_robot):
+    current = current_eef_position(robot, arm)
+    distances = np.linalg.norm(trajectory_robot - current, axis=1)
+    closest_index = int(np.argmin(distances))
+    return closest_index, float(distances[closest_index])
+
+
 def step_toward(robot, arm, target_robot, max_delta, gripper_command=None, target_orientation_robot=None):
     target = th.tensor(target_robot, dtype=th.float32)
     current = robot.get_relative_eef_position(arm=arm)
@@ -352,9 +363,14 @@ def drive_to_waypoint(
 
 def execute_prediction(robot, arm, prediction, trajectory_robot, args):
     print(
-        f"Executing e{prediction.index}: {prediction.path.name} "
+        f"Started e{prediction.index}: {prediction.path.name} "
         f"(candidate {prediction.best_candidate}, loss {prediction.best_loss:.4f})"
     )
+    print(f"Stage: prediction trajectory has {len(trajectory_robot)} waypoints.")
+    if args.open_gripper_command is None:
+        print("Stage: open gripper skipped; no --open-gripper-command provided.")
+    else:
+        print("Stage: open gripper command active while moving to first waypoint.")
 
     first_waypoint = trajectory_robot[0]
     status, contact_paths = drive_to_waypoint(
@@ -368,19 +384,59 @@ def execute_prediction(robot, arm, prediction, trajectory_robot, args):
     if status == "contact":
         print(f"Stopped e{prediction.index}: end effector contact with {format_contact_paths(contact_paths)}.")
         return
-    if status != "reached":
+    next_waypoint_index = 1
+    if status == "reached":
+        print("Stage: moved end effector to first waypoint.")
+    else:
         print("Warning: did not reach the first prediction waypoint within the step budget.")
-        print(f"Aborted e{prediction.index}; no further IK commands sent.")
-        return
+        closest_index, closest_distance = closest_trajectory_index(robot, arm, trajectory_robot)
+        print(
+            f"Stage: first waypoint not reached; closest available trajectory waypoint is "
+            f"{closest_index} ({closest_distance:.3f} m away)."
+        )
+        if closest_index > 0 and closest_distance > args.position_tolerance:
+            print(f"Stage: moving end effector to closest available waypoint {closest_index}.")
+            status, contact_paths = drive_to_waypoint(
+                robot,
+                arm,
+                trajectory_robot[closest_index],
+                args,
+                gripper_command=args.open_gripper_command,
+                stop_on_contact=True,
+            )
+            if status == "contact":
+                print(f"Stopped e{prediction.index}: end effector contact with {format_contact_paths(contact_paths)}.")
+                return
+            if status == "reached":
+                print(f"Stage: moved end effector to closest available waypoint {closest_index}.")
+            else:
+                print(
+                    f"Warning: closest available waypoint {closest_index} was not reached; "
+                    "continuing from the current end effector pose."
+                )
+        else:
+            print("Stage: continuing from the current end effector pose.")
+        next_waypoint_index = min(closest_index + 1, len(trajectory_robot))
 
     if args.close_gripper_command is not None:
+        print("Stage: close gripper.")
         for _ in range(args.gripper_settle_steps):
             action = compute_no_op_action(robot)
             set_gripper_action(robot, action, arm, args.close_gripper_command)
             robot.apply_action(action)
             og.sim.step()
+    else:
+        print("Stage: close gripper skipped; no --close-gripper-command provided.")
 
-    for waypoint in trajectory_robot[1:: args.waypoint_stride]:
+    if next_waypoint_index >= len(trajectory_robot):
+        print("Stage: no remaining waypoints after closest available point.")
+    else:
+        print(
+            f"Stage: trying to follow the rest of predicted trajectory from waypoint "
+            f"{next_waypoint_index} with stride {args.waypoint_stride}."
+        )
+
+    for waypoint in trajectory_robot[next_waypoint_index :: args.waypoint_stride]:
         status, contact_paths = drive_to_waypoint(
             robot,
             arm,
@@ -393,6 +449,7 @@ def execute_prediction(robot, arm, prediction, trajectory_robot, args):
             print(f"Stopped e{prediction.index}: end effector contact with {format_contact_paths(contact_paths)}.")
             return
 
+    print("Stage: end of predicted trajectory.")
     print(f"Finished e{prediction.index}.")
 
 
