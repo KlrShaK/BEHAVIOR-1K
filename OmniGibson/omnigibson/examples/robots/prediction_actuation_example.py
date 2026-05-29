@@ -284,7 +284,13 @@ def get_end_effector_contacts(robot, arm):
         with_set=None,
         current_only=True,
     )
-    return sorted({other_contact for _, other_contact in contact_pairs if other_contact not in robot_link_paths})
+    return sorted(
+        {
+            other_contact
+            for _, other_contact in contact_pairs
+            if other_contact not in robot_link_paths
+        }
+    )
 
 
 def format_contact_paths(contact_paths):
@@ -297,14 +303,30 @@ def current_eef_position(robot, arm):
     return robot.get_relative_eef_position(arm=arm).detach().cpu().numpy()
 
 
-def closest_trajectory_index(robot, arm, trajectory_robot):
+def closest_trajectory_index(robot, arm, trajectory_robot, prefer_behind_x=False):
     current = current_eef_position(robot, arm)
-    distances = np.linalg.norm(trajectory_robot - current, axis=1)
-    closest_index = int(np.argmin(distances))
-    return closest_index, float(distances[closest_index])
+    candidate_indices = np.arange(len(trajectory_robot))
+    if prefer_behind_x:
+        behind_mask = trajectory_robot[:, 0] <= current[0]
+        if np.any(behind_mask):
+            candidate_indices = candidate_indices[behind_mask]
+
+    candidate_points = trajectory_robot[candidate_indices]
+    distances = np.linalg.norm(candidate_points - current, axis=1)
+    closest_candidate = int(np.argmin(distances))
+    closest_index = int(candidate_indices[closest_candidate])
+    return closest_index, float(distances[closest_candidate]), current
 
 
-def step_toward(robot, arm, target_robot, max_delta, gripper_command=None, target_orientation_robot=None):
+def step_toward(
+    robot,
+    arm,
+    target_robot,
+    max_delta,
+    gripper_command=None,
+    target_orientation_robot=None,
+    check_contacts=False,
+):
     target = th.tensor(target_robot, dtype=th.float32)
     current = robot.get_relative_eef_position(arm=arm)
     delta = target - current
@@ -333,7 +355,7 @@ def step_toward(robot, arm, target_robot, max_delta, gripper_command=None, targe
     set_gripper_action(robot, action, arm, gripper_command)
     robot.apply_action(action)
     og.sim.step()
-    return distance, get_end_effector_contacts(robot, arm)
+    return distance, get_end_effector_contacts(robot, arm) if check_contacts else []
 
 
 def drive_to_waypoint(
@@ -353,6 +375,7 @@ def drive_to_waypoint(
             max_delta=args.max_delta,
             gripper_command=gripper_command,
             target_orientation_robot=target_orientation_robot,
+            check_contacts=stop_on_contact,
         )
         if stop_on_contact and contact_paths:
             return "contact", contact_paths
@@ -373,6 +396,7 @@ def execute_prediction(robot, arm, prediction, trajectory_robot, args):
         print("Stage: open gripper command active while moving to first waypoint.")
 
     first_waypoint = trajectory_robot[0]
+    print("Stage: moving end effector to first waypoint.")
     status, contact_paths = drive_to_waypoint(
         robot,
         arm,
@@ -381,18 +405,28 @@ def execute_prediction(robot, arm, prediction, trajectory_robot, args):
         gripper_command=args.open_gripper_command,
         stop_on_contact=True,
     )
-    if status == "contact":
-        print(f"Stopped e{prediction.index}: end effector contact with {format_contact_paths(contact_paths)}.")
-        return
     next_waypoint_index = 1
     if status == "reached":
         print("Stage: moved end effector to first waypoint.")
     else:
-        print("Warning: did not reach the first prediction waypoint within the step budget.")
-        closest_index, closest_distance = closest_trajectory_index(robot, arm, trajectory_robot)
+        if status == "contact":
+            print(
+                f"Warning: stopped moving to first waypoint after end effector contact with "
+                f"{format_contact_paths(contact_paths)}."
+            )
+            print("Stage: contact checks disabled after approach; contact is expected during drawer actuation.")
+        else:
+            print("Warning: did not reach the first prediction waypoint within the step budget.")
+        closest_index, closest_distance, current_position = closest_trajectory_index(
+            robot,
+            arm,
+            trajectory_robot,
+            prefer_behind_x=True,
+        )
         print(
             f"Stage: first waypoint not reached; closest available trajectory waypoint is "
-            f"{closest_index} ({closest_distance:.3f} m away)."
+            f"{closest_index} ({closest_distance:.3f} m away, current x={current_position[0]:.3f}, "
+            f"waypoint x={trajectory_robot[closest_index, 0]:.3f})."
         )
         if closest_index > 0 and closest_distance > args.position_tolerance:
             print(f"Stage: moving end effector to closest available waypoint {closest_index}.")
@@ -402,11 +436,8 @@ def execute_prediction(robot, arm, prediction, trajectory_robot, args):
                 trajectory_robot[closest_index],
                 args,
                 gripper_command=args.open_gripper_command,
-                stop_on_contact=True,
+                stop_on_contact=False,
             )
-            if status == "contact":
-                print(f"Stopped e{prediction.index}: end effector contact with {format_contact_paths(contact_paths)}.")
-                return
             if status == "reached":
                 print(f"Stage: moved end effector to closest available waypoint {closest_index}.")
             else:
@@ -443,11 +474,8 @@ def execute_prediction(robot, arm, prediction, trajectory_robot, args):
             waypoint,
             args,
             gripper_command=args.close_gripper_command,
-            stop_on_contact=True,
+            stop_on_contact=False,
         )
-        if status == "contact":
-            print(f"Stopped e{prediction.index}: end effector contact with {format_contact_paths(contact_paths)}.")
-            return
 
     print("Stage: end of predicted trajectory.")
     print(f"Finished e{prediction.index}.")
