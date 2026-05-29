@@ -80,6 +80,7 @@ class PredictionKeyHandler:
             return True
 
         if event.input == lazy.carb.input.KeyboardInput.R:
+            self.pending_index = None
             self.reset_requested = True
             return True
 
@@ -453,8 +454,11 @@ def drive_to_waypoint(
     target_orientation_robot=None,
     stop_on_contact=False,
     target_is_tcp=True,
+    key_handler=None,
 ):
     for _ in range(args.max_steps_per_waypoint):
+        if key_handler is not None and key_handler.reset_requested:
+            return "reset", []
         distance, contact_paths, link_violations = step_toward(
             robot=robot,
             arm=arm,
@@ -471,12 +475,14 @@ def drive_to_waypoint(
             return "link_ahead", link_violations
         if stop_on_contact and contact_paths:
             return "contact", contact_paths
+        if key_handler is not None and key_handler.reset_requested:
+            return "reset", []
         if distance <= args.position_tolerance:
             return "reached", []
     return "timeout", []
 
 
-def execute_prediction(robot, arm, prediction, trajectory_robot, args):
+def execute_prediction(robot, arm, prediction, trajectory_robot, args, key_handler=None):
     print(
         f"Started e{prediction.index}: {prediction.path.name} "
         f"(candidate {prediction.best_candidate}, loss {prediction.best_loss:.4f})"
@@ -496,7 +502,11 @@ def execute_prediction(robot, arm, prediction, trajectory_robot, args):
         args,
         gripper_command=args.open_gripper_command,
         stop_on_contact=True,
+        key_handler=key_handler,
     )
+    if status == "reset":
+        print("Reset requested; interrupting prediction before first waypoint completion.")
+        return "reset"
     next_waypoint_index = 1
     recovery_waypoint_index = None
     if status == "reached":
@@ -546,10 +556,16 @@ def execute_prediction(robot, arm, prediction, trajectory_robot, args):
     if args.close_gripper_command is not None:
         print("Stage: close gripper.")
         for _ in range(args.gripper_settle_steps):
+            if key_handler is not None and key_handler.reset_requested:
+                print("Reset requested; interrupting prediction during close gripper.")
+                return "reset"
             action = compute_no_op_action(robot)
             set_gripper_action(robot, action, arm, args.close_gripper_command)
             robot.apply_action(action)
             og.sim.step()
+            if key_handler is not None and key_handler.reset_requested:
+                print("Reset requested; interrupting prediction during close gripper.")
+                return "reset"
     else:
         print("Stage: close gripper skipped; no --close-gripper-command provided.")
 
@@ -573,7 +589,11 @@ def execute_prediction(robot, arm, prediction, trajectory_robot, args):
             args,
             gripper_command=args.close_gripper_command,
             stop_on_contact=False,
+            key_handler=key_handler,
         )
+        if status == "reset":
+            print("Reset requested; interrupting prediction during recovery waypoint.")
+            return "reset"
         if status == "reached":
             print(f"Stage: moved gripper TCP to closest available waypoint {recovery_waypoint_index}.")
         elif status == "link_ahead":
@@ -622,7 +642,11 @@ def execute_prediction(robot, arm, prediction, trajectory_robot, args):
             args,
             gripper_command=args.close_gripper_command,
             stop_on_contact=False,
+            key_handler=key_handler,
         )
+        if status == "reset":
+            print("Reset requested; interrupting prediction while following trajectory.")
+            return "reset"
         if status == "link_ahead":
             print(
                 "Stopped prediction: trajectory step would place an arm link ahead of the gripper TCP: "
@@ -632,6 +656,7 @@ def execute_prediction(robot, arm, prediction, trajectory_robot, args):
 
     print("Stage: end of predicted trajectory.")
     print(f"Finished e{prediction.index}.")
+    return "finished"
 
 
 def reset_arm_to_home(robot, arm, home_position_robot, home_orientation_robot, args):
@@ -649,6 +674,17 @@ def reset_arm_to_home(robot, arm, home_position_robot, home_orientation_robot, a
         print("Arm reset finished.")
     else:
         print("Warning: arm reset did not reach home position within the step budget.")
+
+
+def run_arm_reset(robot, arm, home_position_robot, home_orientation_robot, args):
+    reset_arm_to_home(
+        robot=robot,
+        arm=arm,
+        home_position_robot=home_position_robot,
+        home_orientation_robot=home_orientation_robot,
+        args=args,
+    )
+    print("Ready for another prediction after arm reset.")
 
 
 def print_prediction_menu(predictions):
@@ -769,15 +805,9 @@ def main():
         while not key_handler.quit_requested:
             if key_handler.reset_requested:
                 key_handler.reset_requested = False
+                key_handler.pending_index = None
                 try:
-                    reset_arm_to_home(
-                        robot=robot,
-                        arm=arm,
-                        home_position_robot=home_position_robot,
-                        home_orientation_robot=home_orientation_robot,
-                        args=args,
-                    )
-                    print("Ready for another prediction after arm reset.")
+                    run_arm_reset(robot, arm, home_position_robot, home_orientation_robot, args)
                 except Exception:
                     print("Failed to reset arm; simulator remains open.")
                     traceback.print_exc()
@@ -787,14 +817,20 @@ def main():
                 key_handler.pending_index = None
                 prediction = predictions[prediction_index - 1]
                 try:
-                    execute_prediction(
+                    result = execute_prediction(
                         robot=robot,
                         arm=arm,
                         prediction=prediction,
                         trajectory_robot=trajectories_robot[prediction_index],
                         args=args,
+                        key_handler=key_handler,
                     )
-                    print(f"Ready for another prediction after e{prediction.index}.")
+                    if result == "reset":
+                        key_handler.reset_requested = False
+                        key_handler.pending_index = None
+                        run_arm_reset(robot, arm, home_position_robot, home_orientation_robot, args)
+                    else:
+                        print(f"Ready for another prediction after e{prediction.index}.")
                 except Exception:
                     print(f"Failed to execute e{prediction.index}; simulator remains open.")
                     traceback.print_exc()
