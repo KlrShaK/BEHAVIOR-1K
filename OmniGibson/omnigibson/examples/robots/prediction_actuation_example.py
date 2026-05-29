@@ -42,6 +42,7 @@ class PredictionKeyHandler:
 
     def __init__(self, num_predictions):
         self.pending_index = None
+        self.reset_requested = False
         self.quit_requested = False
         self._armed_until = 0.0
         self._num_predictions = num_predictions
@@ -74,6 +75,10 @@ class PredictionKeyHandler:
         if event.input == lazy.carb.input.KeyboardInput.E:
             self._armed_until = time.time() + 2.0
             print("Prediction execution armed. Press 1-9 within 2 seconds.")
+            return True
+
+        if event.input == lazy.carb.input.KeyboardInput.R:
+            self.reset_requested = True
             return True
 
         if event.input == lazy.carb.input.KeyboardInput.ESCAPE:
@@ -297,6 +302,21 @@ def execute_prediction(robot, arm, prediction, trajectory_robot, args):
     print(f"Finished e{prediction.index}.")
 
 
+def reset_arm_to_home(robot, arm, home_position_robot, args):
+    print("Resetting arm to captured home position.")
+    reached = drive_to_waypoint(
+        robot=robot,
+        arm=arm,
+        waypoint=home_position_robot,
+        args=args,
+        gripper_command=args.open_gripper_command,
+    )
+    if reached:
+        print("Arm reset finished.")
+    else:
+        print("Warning: arm reset did not reach home position within the step budget.")
+
+
 def print_prediction_menu(predictions):
     print("")
     print("Available predictions:")
@@ -306,7 +326,7 @@ def print_prediction_menu(predictions):
             f"label={prediction.label} best={prediction.best_candidate} loss={prediction.best_loss:.4f}"
         )
     print("")
-    print("Press E then a number to execute a prediction. Press ESC to quit.")
+    print("Press E then a number to execute a prediction. Press R to reset the arm. Press ESC to quit.")
 
 
 def main():
@@ -370,6 +390,10 @@ def main():
         )
 
     arm = metadata["robot"].get("default_arm", robot.default_arm)
+    home_position_robot = np.asarray(
+        metadata["robot"]["eef_poses"][arm]["robot_relative"]["position"],
+        dtype=np.float32,
+    )
     trajectories_robot = {
         prediction.index: prediction_to_robot_trajectory(prediction, metadata, args.camera_frame)
         for prediction in predictions
@@ -380,7 +404,21 @@ def main():
 
     try:
         while not key_handler.quit_requested:
-            if key_handler.pending_index is not None:
+            if key_handler.reset_requested:
+                key_handler.reset_requested = False
+                try:
+                    reset_arm_to_home(
+                        robot=robot,
+                        arm=arm,
+                        home_position_robot=home_position_robot,
+                        args=args,
+                    )
+                    print("Ready for another prediction after arm reset.")
+                except Exception:
+                    print("Failed to reset arm; simulator remains open.")
+                    traceback.print_exc()
+                print_prediction_menu(predictions)
+            elif key_handler.pending_index is not None:
                 prediction_index = key_handler.pending_index
                 key_handler.pending_index = None
                 prediction = predictions[prediction_index - 1]
