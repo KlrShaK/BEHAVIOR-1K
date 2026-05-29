@@ -331,6 +331,22 @@ def closest_trajectory_index(robot, arm, trajectory_robot, recovery_x_clearance=
     return closest_index, float(distances[closest_candidate]), current, has_safe_x_candidate
 
 
+def constrain_waypoint_vertical_angle(robot, arm, waypoint, max_vertical_angle_deg):
+    if max_vertical_angle_deg is None or max_vertical_angle_deg >= 90.0:
+        return waypoint, False
+
+    current = current_eef_position(robot, arm)
+    constrained = np.array(waypoint, dtype=np.float32, copy=True)
+    xy_distance = np.linalg.norm(constrained[:2] - current[:2])
+    max_dz = np.tan(np.deg2rad(max_vertical_angle_deg)) * xy_distance
+    dz = constrained[2] - current[2]
+    if abs(dz) <= max_dz:
+        return constrained, False
+
+    constrained[2] = current[2] + np.sign(dz) * max_dz
+    return constrained, True
+
+
 def step_toward(
     robot,
     arm,
@@ -471,10 +487,21 @@ def execute_prediction(robot, arm, prediction, trajectory_robot, args):
 
     if recovery_waypoint_index is not None:
         print(f"Stage: moving end effector to closest available waypoint {recovery_waypoint_index}.")
-        status, contact_paths = drive_to_waypoint(
+        recovery_waypoint, constrained = constrain_waypoint_vertical_angle(
             robot,
             arm,
             trajectory_robot[recovery_waypoint_index],
+            args.trajectory_max_vertical_angle_deg,
+        )
+        if constrained:
+            print(
+                f"Stage: constrained recovery waypoint vertical motion to "
+                f"{args.trajectory_max_vertical_angle_deg:.1f} deg from the XY plane."
+            )
+        status, contact_paths = drive_to_waypoint(
+            robot,
+            arm,
+            recovery_waypoint,
             args,
             gripper_command=args.close_gripper_command,
             stop_on_contact=False,
@@ -503,6 +530,17 @@ def execute_prediction(robot, arm, prediction, trajectory_robot, args):
                 "and moving further into the cabinet is disabled after approach."
             )
             continue
+        waypoint, constrained = constrain_waypoint_vertical_angle(
+            robot,
+            arm,
+            waypoint,
+            args.trajectory_max_vertical_angle_deg,
+        )
+        if constrained:
+            print(
+                f"Stage: constrained waypoint vertical motion to "
+                f"{args.trajectory_max_vertical_angle_deg:.1f} deg from the XY plane."
+            )
         status, contact_paths = drive_to_waypoint(
             robot,
             arm,
@@ -583,6 +621,12 @@ def main():
         type=float,
         default=0.0,
         help="Allowed robot-frame x increase after approach recovery; 0 prevents pushing farther into the cabinet.",
+    )
+    parser.add_argument(
+        "--trajectory-max-vertical-angle-deg",
+        type=float,
+        default=30.0,
+        help="Max vertical angle from the robot XY plane while executing predicted trajectory waypoints.",
     )
     parser.add_argument(
         "--waypoint-stride",
