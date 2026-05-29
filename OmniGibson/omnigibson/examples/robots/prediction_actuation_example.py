@@ -303,8 +303,49 @@ def current_eef_position(robot, arm):
     return robot.get_relative_eef_position(arm=arm).detach().cpu().numpy()
 
 
+def world_position_to_robot(robot, world_position):
+    robot_position, robot_orientation = robot.get_position_orientation()
+    robot_position = robot_position.detach().cpu().numpy()
+    robot_orientation = robot_orientation.detach().cpu().numpy()
+    world_position = np.asarray(world_position.detach().cpu().numpy(), dtype=np.float32)
+    return NT.quat2mat(robot_orientation).T @ (world_position - robot_position)
+
+
+def current_gripper_tcp_position(robot, arm):
+    finger_links = robot.finger_links.get(arm, [])
+    if not finger_links:
+        return current_eef_position(robot, arm)
+
+    finger_positions = [
+        world_position_to_robot(robot, finger_link.get_position_orientation()[0])
+        for finger_link in finger_links
+    ]
+    return np.mean(finger_positions, axis=0)
+
+
+def current_control_point_position(robot, arm, target_is_tcp):
+    return current_gripper_tcp_position(robot, arm) if target_is_tcp else current_eef_position(robot, arm)
+
+
+def arm_links_ahead_of_gripper(robot, arm, margin):
+    gripper_x = current_gripper_tcp_position(robot, arm)[0]
+    violations = []
+    for link in robot.arm_links.get(arm, []):
+        link_x = world_position_to_robot(robot, link.get_position_orientation()[0])[0]
+        excess = link_x - gripper_x - margin
+        if excess > 0.0:
+            violations.append((link.prim_path, float(link_x), float(excess)))
+    return sorted(violations, key=lambda item: item[2], reverse=True)
+
+
+def format_link_violations(violations):
+    preview = [f"{path} x={link_x:.3f} excess={excess:.3f}" for path, link_x, excess in violations[:3]]
+    suffix = "" if len(violations) <= len(preview) else f" and {len(violations) - len(preview)} more"
+    return "; ".join(preview) + suffix
+
+
 def closest_trajectory_index(robot, arm, trajectory_robot, recovery_x_clearance=0.0):
-    current = current_eef_position(robot, arm)
+    current = current_gripper_tcp_position(robot, arm)
     candidate_indices = np.arange(len(trajectory_robot))
     has_safe_x_candidate = False
     if recovery_x_clearance > 0.0:
@@ -335,7 +376,7 @@ def constrain_waypoint_vertical_angle(robot, arm, waypoint, max_vertical_angle_d
     if max_vertical_angle_deg is None or max_vertical_angle_deg >= 90.0:
         return waypoint, False
 
-    current = current_eef_position(robot, arm)
+    current = current_gripper_tcp_position(robot, arm)
     constrained = np.array(waypoint, dtype=np.float32, copy=True)
     xy_distance = np.linalg.norm(constrained[:2] - current[:2])
     max_dz = np.tan(np.deg2rad(max_vertical_angle_deg)) * xy_distance
@@ -355,20 +396,30 @@ def step_toward(
     gripper_command=None,
     target_orientation_robot=None,
     check_contacts=False,
+    keep_arm_links_behind_gripper=True,
+    arm_link_behind_gripper_margin=0.0,
+    target_is_tcp=True,
 ):
     target = th.tensor(target_robot, dtype=th.float32)
-    current = robot.get_relative_eef_position(arm=arm)
-    delta = target - current
+    current_control_point = th.tensor(
+        current_control_point_position(robot, arm, target_is_tcp),
+        dtype=th.float32,
+    )
+    delta = target - current_control_point
     distance = th.norm(delta).item()
     if distance > max_delta:
         delta = delta / distance * max_delta
 
     action = compute_no_op_action(robot)
+    previous_joint_positions = robot.get_joint_positions().clone()
     arm_action_idx = robot.arm_action_idx[arm]
     arm_command_dim = action[arm_action_idx].numel()
     if arm_command_dim == 6:
         if target_orientation_robot is None:
-            target_orientation_robot = horizontal_target_axisangle(current.detach().cpu().numpy(), target_robot)
+            target_orientation_robot = horizontal_target_axisangle(
+                current_control_point.detach().cpu().numpy(),
+                target_robot,
+            )
         orientation = (
             robot.get_relative_eef_orientation(arm=arm)
             if target_orientation_robot is None
@@ -384,7 +435,13 @@ def step_toward(
     set_gripper_action(robot, action, arm, gripper_command)
     robot.apply_action(action)
     og.sim.step()
-    return distance, get_end_effector_contacts(robot, arm) if check_contacts else []
+    if keep_arm_links_behind_gripper:
+        link_violations = arm_links_ahead_of_gripper(robot, arm, arm_link_behind_gripper_margin)
+        if link_violations:
+            robot.set_joint_positions(previous_joint_positions, drive=False)
+            og.sim.step()
+            return distance, [], link_violations
+    return distance, get_end_effector_contacts(robot, arm) if check_contacts else [], []
 
 
 def drive_to_waypoint(
@@ -395,9 +452,10 @@ def drive_to_waypoint(
     gripper_command=None,
     target_orientation_robot=None,
     stop_on_contact=False,
+    target_is_tcp=True,
 ):
     for _ in range(args.max_steps_per_waypoint):
-        distance, contact_paths = step_toward(
+        distance, contact_paths, link_violations = step_toward(
             robot=robot,
             arm=arm,
             target_robot=waypoint,
@@ -405,7 +463,12 @@ def drive_to_waypoint(
             gripper_command=gripper_command,
             target_orientation_robot=target_orientation_robot,
             check_contacts=stop_on_contact,
+            keep_arm_links_behind_gripper=args.keep_arm_links_behind_gripper,
+            arm_link_behind_gripper_margin=args.arm_link_behind_gripper_margin,
+            target_is_tcp=target_is_tcp,
         )
+        if link_violations:
+            return "link_ahead", link_violations
         if stop_on_contact and contact_paths:
             return "contact", contact_paths
         if distance <= args.position_tolerance:
@@ -418,14 +481,14 @@ def execute_prediction(robot, arm, prediction, trajectory_robot, args):
         f"Started e{prediction.index}: {prediction.path.name} "
         f"(candidate {prediction.best_candidate}, loss {prediction.best_loss:.4f})"
     )
-    print(f"Stage: prediction trajectory has {len(trajectory_robot)} waypoints.")
+    print(f"Stage: prediction trajectory has {len(trajectory_robot)} gripper TCP waypoints.")
     if args.open_gripper_command is None:
         print("Stage: open gripper skipped; no --open-gripper-command provided.")
     else:
         print("Stage: open gripper command active while moving to first waypoint.")
 
     first_waypoint = trajectory_robot[0]
-    print("Stage: moving end effector to first waypoint.")
+    print("Stage: moving gripper TCP to first waypoint.")
     status, contact_paths = drive_to_waypoint(
         robot,
         arm,
@@ -437,14 +500,19 @@ def execute_prediction(robot, arm, prediction, trajectory_robot, args):
     next_waypoint_index = 1
     recovery_waypoint_index = None
     if status == "reached":
-        print("Stage: moved end effector to first waypoint.")
+        print("Stage: moved gripper TCP to first waypoint.")
     else:
         if status == "contact":
             print(
-                f"Warning: stopped moving to first waypoint after end effector contact with "
+                f"Warning: stopped moving to first waypoint after gripper / EEF contact with "
                 f"{format_contact_paths(contact_paths)}."
             )
             print("Stage: contact checks disabled after approach; contact is expected during drawer actuation.")
+        elif status == "link_ahead":
+            print(
+                "Warning: stopped moving to first waypoint because an arm link moved ahead of the gripper TCP: "
+                f"{format_link_violations(contact_paths)}."
+            )
         else:
             print("Warning: did not reach the first prediction waypoint within the step budget.")
         closest_index, closest_distance, current_position, has_safe_x_candidate = closest_trajectory_index(
@@ -454,14 +522,14 @@ def execute_prediction(robot, arm, prediction, trajectory_robot, args):
             recovery_x_clearance=args.approach_recovery_x_clearance,
         )
         print(
-            f"Stage: first waypoint not reached; closest available trajectory waypoint is "
+            f"Stage: first waypoint not reached; closest available gripper TCP waypoint is "
             f"{closest_index} ({closest_distance:.3f} m away, current x={current_position[0]:.3f}, "
             f"waypoint x={trajectory_robot[closest_index, 0]:.3f}, "
             f"required x<={current_position[0] - args.approach_recovery_x_clearance:.3f})."
         )
         if not has_safe_x_candidate:
             print(
-                "Warning: no trajectory waypoint is behind the current end effector x; "
+                "Warning: no trajectory waypoint is behind the current gripper TCP x; "
                 "skipping recovery move to avoid pushing into the cabinet."
             )
             next_waypoint_index = len(trajectory_robot)
@@ -471,7 +539,7 @@ def execute_prediction(robot, arm, prediction, trajectory_robot, args):
                 f"Stage: closest available waypoint {closest_index} will be executed after close gripper."
             )
         else:
-            print("Stage: continuing from the current end effector pose.")
+            print("Stage: continuing from the current gripper TCP pose.")
         if has_safe_x_candidate:
             next_waypoint_index = min(closest_index + 1, len(trajectory_robot))
 
@@ -486,7 +554,7 @@ def execute_prediction(robot, arm, prediction, trajectory_robot, args):
         print("Stage: close gripper skipped; no --close-gripper-command provided.")
 
     if recovery_waypoint_index is not None:
-        print(f"Stage: moving end effector to closest available waypoint {recovery_waypoint_index}.")
+        print(f"Stage: moving gripper TCP to closest available waypoint {recovery_waypoint_index}.")
         recovery_waypoint, constrained = constrain_waypoint_vertical_angle(
             robot,
             arm,
@@ -495,7 +563,7 @@ def execute_prediction(robot, arm, prediction, trajectory_robot, args):
         )
         if constrained:
             print(
-                f"Stage: constrained recovery waypoint vertical motion to "
+                f"Stage: constrained recovery gripper TCP vertical motion to "
                 f"{args.trajectory_max_vertical_angle_deg:.1f} deg from the XY plane."
             )
         status, contact_paths = drive_to_waypoint(
@@ -507,11 +575,17 @@ def execute_prediction(robot, arm, prediction, trajectory_robot, args):
             stop_on_contact=False,
         )
         if status == "reached":
-            print(f"Stage: moved end effector to closest available waypoint {recovery_waypoint_index}.")
+            print(f"Stage: moved gripper TCP to closest available waypoint {recovery_waypoint_index}.")
+        elif status == "link_ahead":
+            print(
+                "Stopped prediction: recovery would place an arm link ahead of the gripper TCP: "
+                f"{format_link_violations(contact_paths)}."
+            )
+            return
         else:
             print(
                 f"Warning: closest available waypoint {recovery_waypoint_index} was not reached; "
-                "continuing from the current end effector pose."
+                "continuing from the current gripper TCP pose."
             )
 
     if next_waypoint_index >= len(trajectory_robot):
@@ -523,10 +597,10 @@ def execute_prediction(robot, arm, prediction, trajectory_robot, args):
         )
 
     for waypoint in trajectory_robot[next_waypoint_index :: args.waypoint_stride]:
-        current_position = current_eef_position(robot, arm)
+        current_position = current_gripper_tcp_position(robot, arm)
         if waypoint[0] > current_position[0] + args.max_forward_x_after_approach:
             print(
-                f"Stage: skipping waypoint at x={waypoint[0]:.3f}; current x={current_position[0]:.3f} "
+                f"Stage: skipping waypoint at x={waypoint[0]:.3f}; current TCP x={current_position[0]:.3f} "
                 "and moving further into the cabinet is disabled after approach."
             )
             continue
@@ -549,6 +623,12 @@ def execute_prediction(robot, arm, prediction, trajectory_robot, args):
             gripper_command=args.close_gripper_command,
             stop_on_contact=False,
         )
+        if status == "link_ahead":
+            print(
+                "Stopped prediction: trajectory step would place an arm link ahead of the gripper TCP: "
+                f"{format_link_violations(contact_paths)}."
+            )
+            return
 
     print("Stage: end of predicted trajectory.")
     print(f"Finished e{prediction.index}.")
@@ -563,6 +643,7 @@ def reset_arm_to_home(robot, arm, home_position_robot, home_orientation_robot, a
         args=args,
         gripper_command=args.open_gripper_command,
         target_orientation_robot=home_orientation_robot,
+        target_is_tcp=False,
     )
     if status == "reached":
         print("Arm reset finished.")
@@ -627,6 +708,18 @@ def main():
         type=float,
         default=30.0,
         help="Max vertical angle from the robot XY plane while executing predicted trajectory waypoints.",
+    )
+    parser.add_argument(
+        "--disable-arm-link-behind-gripper-guard",
+        dest="keep_arm_links_behind_gripper",
+        action="store_false",
+        help="Disable rejecting IK steps where arm links move ahead of the gripper TCP in robot-frame x.",
+    )
+    parser.add_argument(
+        "--arm-link-behind-gripper-margin",
+        type=float,
+        default=0.0,
+        help="Required robot-frame x margin, in meters, for arm links to remain behind the gripper TCP.",
     )
     parser.add_argument(
         "--waypoint-stride",
