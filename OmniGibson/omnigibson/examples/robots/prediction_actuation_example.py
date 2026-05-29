@@ -20,6 +20,8 @@ import omnigibson as og
 import omnigibson.lazy as lazy
 from omnigibson.controllers import ControllerView
 from omnigibson.macros import gm
+import omnigibson.utils.transform_utils_np as NT
+from omnigibson.utils.usd_utils import RigidContactAPI
 
 
 gm.USE_GPU_DYNAMICS = False
@@ -167,6 +169,30 @@ def prediction_to_robot_trajectory(prediction, metadata, camera_frame):
     return transform_points(t_robot_world, trajectory_world)
 
 
+def quat_to_axisangle(quat):
+    return np.asarray(NT.quat2axisangle(np.asarray(quat, dtype=np.float32)), dtype=np.float32)
+
+
+def horizontal_target_axisangle(current_robot, target_robot):
+    direction = np.asarray(target_robot, dtype=np.float32) - np.asarray(current_robot, dtype=np.float32)
+    direction[2] = 0.0
+    norm = np.linalg.norm(direction)
+    if norm < 1e-6:
+        return None
+
+    forward = direction / norm
+    up = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+    side = np.cross(up, forward)
+    side_norm = np.linalg.norm(side)
+    if side_norm < 1e-6:
+        side = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+    else:
+        side = side / side_norm
+    vertical = np.cross(forward, side)
+    rotation = np.column_stack((side, vertical, forward))
+    return quat_to_axisangle(NT.mat2quat(rotation))
+
+
 def build_environment(metadata, scene_model, empty_scene):
     robot_metadata = metadata["robot"]
     scene_cfg = (
@@ -184,7 +210,7 @@ def build_environment(metadata, scene_model, empty_scene):
         "controller_config": {
             "arm_0": {
                 "name": "InverseKinematicsController",
-                "mode": "position_fixed_ori",
+                "mode": "pose_absolute_ori",
                 "command_input_limits": None,
             },
             "gripper_0": {
@@ -248,7 +274,26 @@ def set_gripper_action(robot, action, arm, command):
     action[robot.gripper_action_idx[arm]] = float(command)
 
 
-def step_toward(robot, arm, target_robot, max_delta, gripper_command=None):
+def get_end_effector_contacts(robot, arm):
+    end_effector_paths = {robot.eef_links[arm].prim_path}
+    end_effector_paths.update(link.prim_path for link in robot.finger_links.get(arm, []))
+    robot_link_paths = set(robot.link_prim_paths)
+    contact_pairs = RigidContactAPI.get_contact_pairs(
+        scene_idx=robot.scene.idx,
+        query_set=end_effector_paths,
+        with_set=None,
+        current_only=True,
+    )
+    return sorted({other_contact for _, other_contact in contact_pairs if other_contact not in robot_link_paths})
+
+
+def format_contact_paths(contact_paths):
+    preview = contact_paths[:3]
+    suffix = "" if len(contact_paths) <= len(preview) else f" and {len(contact_paths) - len(preview)} more"
+    return ", ".join(preview) + suffix
+
+
+def step_toward(robot, arm, target_robot, max_delta, gripper_command=None, target_orientation_robot=None):
     target = th.tensor(target_robot, dtype=th.float32)
     current = robot.get_relative_eef_position(arm=arm)
     delta = target - current
@@ -257,25 +302,52 @@ def step_toward(robot, arm, target_robot, max_delta, gripper_command=None):
         delta = delta / distance * max_delta
 
     action = compute_no_op_action(robot)
-    action[robot.arm_action_idx[arm]] = delta
+    arm_action_idx = robot.arm_action_idx[arm]
+    arm_command_dim = action[arm_action_idx].numel()
+    if arm_command_dim == 6:
+        if target_orientation_robot is None:
+            target_orientation_robot = horizontal_target_axisangle(current.detach().cpu().numpy(), target_robot)
+        orientation = (
+            robot.get_relative_eef_orientation(arm=arm)
+            if target_orientation_robot is None
+            else th.tensor(target_orientation_robot, dtype=th.float32)
+        )
+        if orientation.numel() == 4:
+            orientation = th.tensor(quat_to_axisangle(orientation.detach().cpu().numpy()), dtype=th.float32)
+        action[arm_action_idx] = th.cat([delta, orientation])
+    elif arm_command_dim == 3:
+        action[arm_action_idx] = delta
+    else:
+        raise ValueError(f"Unsupported arm action dimension for {arm}: {arm_command_dim}")
     set_gripper_action(robot, action, arm, gripper_command)
     robot.apply_action(action)
     og.sim.step()
-    return distance
+    return distance, get_end_effector_contacts(robot, arm)
 
 
-def drive_to_waypoint(robot, arm, waypoint, args, gripper_command=None):
+def drive_to_waypoint(
+    robot,
+    arm,
+    waypoint,
+    args,
+    gripper_command=None,
+    target_orientation_robot=None,
+    stop_on_contact=False,
+):
     for _ in range(args.max_steps_per_waypoint):
-        distance = step_toward(
+        distance, contact_paths = step_toward(
             robot=robot,
             arm=arm,
             target_robot=waypoint,
             max_delta=args.max_delta,
             gripper_command=gripper_command,
+            target_orientation_robot=target_orientation_robot,
         )
+        if stop_on_contact and contact_paths:
+            return "contact", contact_paths
         if distance <= args.position_tolerance:
-            return True
-    return False
+            return "reached", []
+    return "timeout", []
 
 
 def execute_prediction(robot, arm, prediction, trajectory_robot, args):
@@ -285,9 +357,21 @@ def execute_prediction(robot, arm, prediction, trajectory_robot, args):
     )
 
     first_waypoint = trajectory_robot[0]
-    reached = drive_to_waypoint(robot, arm, first_waypoint, args, gripper_command=args.open_gripper_command)
-    if not reached:
+    status, contact_paths = drive_to_waypoint(
+        robot,
+        arm,
+        first_waypoint,
+        args,
+        gripper_command=args.open_gripper_command,
+        stop_on_contact=True,
+    )
+    if status == "contact":
+        print(f"Stopped e{prediction.index}: end effector contact with {format_contact_paths(contact_paths)}.")
+        return
+    if status != "reached":
         print("Warning: did not reach the first prediction waypoint within the step budget.")
+        print(f"Aborted e{prediction.index}; no further IK commands sent.")
+        return
 
     if args.close_gripper_command is not None:
         for _ in range(args.gripper_settle_steps):
@@ -297,21 +381,32 @@ def execute_prediction(robot, arm, prediction, trajectory_robot, args):
             og.sim.step()
 
     for waypoint in trajectory_robot[1:: args.waypoint_stride]:
-        drive_to_waypoint(robot, arm, waypoint, args, gripper_command=args.close_gripper_command)
+        status, contact_paths = drive_to_waypoint(
+            robot,
+            arm,
+            waypoint,
+            args,
+            gripper_command=args.close_gripper_command,
+            stop_on_contact=True,
+        )
+        if status == "contact":
+            print(f"Stopped e{prediction.index}: end effector contact with {format_contact_paths(contact_paths)}.")
+            return
 
     print(f"Finished e{prediction.index}.")
 
 
-def reset_arm_to_home(robot, arm, home_position_robot, args):
+def reset_arm_to_home(robot, arm, home_position_robot, home_orientation_robot, args):
     print("Resetting arm to captured home position.")
-    reached = drive_to_waypoint(
+    status, _ = drive_to_waypoint(
         robot=robot,
         arm=arm,
         waypoint=home_position_robot,
         args=args,
         gripper_command=args.open_gripper_command,
+        target_orientation_robot=home_orientation_robot,
     )
-    if reached:
+    if status == "reached":
         print("Arm reset finished.")
     else:
         print("Warning: arm reset did not reach home position within the step budget.")
@@ -390,10 +485,9 @@ def main():
         )
 
     arm = metadata["robot"].get("default_arm", robot.default_arm)
-    home_position_robot = np.asarray(
-        metadata["robot"]["eef_poses"][arm]["robot_relative"]["position"],
-        dtype=np.float32,
-    )
+    home_eef_pose = metadata["robot"]["eef_poses"][arm]["robot_relative"]
+    home_position_robot = np.asarray(home_eef_pose["position"], dtype=np.float32)
+    home_orientation_robot = quat_to_axisangle(home_eef_pose["orientation_xyzw"])
     trajectories_robot = {
         prediction.index: prediction_to_robot_trajectory(prediction, metadata, args.camera_frame)
         for prediction in predictions
@@ -411,6 +505,7 @@ def main():
                         robot=robot,
                         arm=arm,
                         home_position_robot=home_position_robot,
+                        home_orientation_robot=home_orientation_robot,
                         args=args,
                     )
                     print("Ready for another prediction after arm reset.")
