@@ -214,13 +214,24 @@ def compute_no_op_action(robot):
     action = th.zeros(robot.action_dim, dtype=th.float32)
     controller_action_idx = robot.controller_action_idx
     for controller_name, (group_key, controller_idx) in robot.controllers.items():
+        action_idx = controller_action_idx[controller_name]
         try:
-            action[controller_action_idx[controller_name]] = ControllerView.compute_no_op_action(
+            no_op = ControllerView.compute_no_op_action(
                 group_key,
                 controller_idx,
-            )
+            ).flatten()
         except ValueError:
-            pass
+            continue
+
+        # Some controllers expose a mode-dependent command_dim but return their
+        # full pose command from compute_no_op_action(). Keep the values that fit
+        # the actual action slice, which is what robot.apply_action() consumes.
+        if no_op.numel() > action_idx.numel():
+            no_op = no_op[: action_idx.numel()]
+        elif no_op.numel() < action_idx.numel():
+            no_op = th.cat([no_op, th.zeros(action_idx.numel() - no_op.numel(), dtype=no_op.dtype)])
+
+        action[action_idx] = no_op.to(dtype=action.dtype)
     return action
 
 
