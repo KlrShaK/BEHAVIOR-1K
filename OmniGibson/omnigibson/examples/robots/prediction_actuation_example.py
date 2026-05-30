@@ -19,6 +19,15 @@ import torch as th
 import omnigibson as og
 import omnigibson.lazy as lazy
 from omnigibson.controllers import ControllerView
+from omnigibson.examples.robots.prediction_ik_optimizer import (
+    OptimizedIKConfig,
+    OptimizedIKSolveOptions,
+    OptimizedIKSolver,
+    current_gripper_tcp_position,
+    scipy_available,
+    tensor_to_numpy,
+    world_position_to_robot,
+)
 from omnigibson.macros import gm
 import omnigibson.utils.transform_utils_np as NT
 from omnigibson.utils.usd_utils import RigidContactAPI
@@ -115,6 +124,17 @@ def decode_ascii_array(array):
     return "".join(chr(int(x)) for x in array)
 
 
+def resolve_capture_dir(capture_dir):
+    if capture_dir.is_absolute() or (capture_dir / "metadata.json").exists():
+        return capture_dir
+
+    repo_root_capture_dir = Path(__file__).resolve().parents[4] / capture_dir
+    if (repo_root_capture_dir / "metadata.json").exists():
+        return repo_root_capture_dir
+
+    return capture_dir
+
+
 def load_metadata(capture_dir):
     metadata_path = capture_dir / "metadata.json"
     if not metadata_path.exists():
@@ -200,12 +220,27 @@ def horizontal_target_axisangle(current_robot, target_robot):
     return quat_to_axisangle(NT.mat2quat(rotation))
 
 
-def build_environment(metadata, scene_model, empty_scene):
+def build_environment(metadata, scene_model, empty_scene, ik_solver):
     robot_metadata = metadata["robot"]
     scene_cfg = (
         {"type": "Scene"}
         if empty_scene
         else {"type": "InteractiveTraversableScene", "scene_model": scene_model}
+    )
+    arm_controller_cfg = (
+        {
+            "name": "JointController",
+            "motor_type": "position",
+            "use_delta_commands": False,
+            "command_input_limits": None,
+            "command_output_limits": None,
+        }
+        if ik_solver == "optimized"
+        else {
+            "name": "InverseKinematicsController",
+            "mode": "pose_absolute_ori",
+            "command_input_limits": None,
+        }
     )
     robot_cfg = {
         "model": robot_metadata.get("model", "fetch"),
@@ -215,11 +250,7 @@ def build_environment(metadata, scene_model, empty_scene):
         "action_type": "continuous",
         "action_normalize": False,
         "controller_config": {
-            "arm_0": {
-                "name": "InverseKinematicsController",
-                "mode": "pose_absolute_ori",
-                "command_input_limits": None,
-            },
+            "arm_0": arm_controller_cfg,
             "gripper_0": {
                 "name": "MultiFingerGripperController",
             },
@@ -310,26 +341,6 @@ def current_eef_position(robot, arm):
     return robot.get_relative_eef_position(arm=arm).detach().cpu().numpy()
 
 
-def world_position_to_robot(robot, world_position):
-    robot_position, robot_orientation = robot.get_position_orientation()
-    robot_position = robot_position.detach().cpu().numpy()
-    robot_orientation = robot_orientation.detach().cpu().numpy()
-    world_position = np.asarray(world_position.detach().cpu().numpy(), dtype=np.float32)
-    return NT.quat2mat(robot_orientation).T @ (world_position - robot_position)
-
-
-def current_gripper_tcp_position(robot, arm):
-    finger_links = robot.finger_links.get(arm, [])
-    if not finger_links:
-        return current_eef_position(robot, arm)
-
-    finger_positions = [
-        world_position_to_robot(robot, finger_link.get_position_orientation()[0])
-        for finger_link in finger_links
-    ]
-    return np.mean(finger_positions, axis=0)
-
-
 def current_control_point_position(robot, arm, target_is_tcp):
     return current_gripper_tcp_position(robot, arm) if target_is_tcp else current_eef_position(robot, arm)
 
@@ -414,6 +425,84 @@ def constrain_waypoint_vertical_angle(robot, arm, waypoint, max_vertical_angle_d
     return constrained, True
 
 
+def optimized_ik_config_from_args(args):
+    return OptimizedIKConfig(
+        max_delta=args.max_delta,
+        position_tolerance=args.position_tolerance,
+        max_joint_delta=args.opt_ik_max_joint_delta,
+        max_nfev=args.opt_ik_max_nfev,
+        arm_link_behind_gripper_margin=args.arm_link_behind_gripper_margin,
+        trajectory_max_vertical_angle_deg=args.trajectory_max_vertical_angle_deg,
+    )
+
+
+def arm_link_constraint_is_active(keep_arm_links_behind_gripper, arm_link_guard_state):
+    if not keep_arm_links_behind_gripper:
+        return False
+    return arm_link_guard_state is None or arm_link_guard_state.active
+
+
+def arm_link_penalty_status(keep_arm_links_behind_gripper, arm_link_guard_state):
+    if not keep_arm_links_behind_gripper:
+        return "off"
+    return "on" if arm_link_constraint_is_active(keep_arm_links_behind_gripper, arm_link_guard_state) else "warmup"
+
+
+def apply_optimized_ik_step(
+    robot,
+    arm,
+    waypoint,
+    args,
+    optimizer,
+    gripper_command=None,
+    check_contacts=False,
+    keep_arm_links_behind_gripper=True,
+    arm_link_guard_state=None,
+):
+    previous_joint_positions = robot.get_joint_positions().clone()
+    previous_joint_velocities = robot.get_joint_velocities().clone()
+    penalize_arm_links = arm_link_constraint_is_active(keep_arm_links_behind_gripper, arm_link_guard_state)
+    result = optimizer.solve(
+        robot=robot,
+        arm=arm,
+        target_robot=waypoint,
+        options=OptimizedIKSolveOptions(penalize_arm_links_ahead=penalize_arm_links),
+    )
+
+    if args.opt_ik_debug:
+        print(
+            f"OptIK: cost={result.cost:.5f} nfev={result.nfev} "
+            f"tcp_error={result.tcp_error:.4f} max_link_ahead_excess={result.max_link_ahead_excess:.4f} "
+            f"joint_delta={result.joint_delta_norm:.4f} optimality={result.optimality:.3e} "
+            f"arm_link_penalty={arm_link_penalty_status(keep_arm_links_behind_gripper, arm_link_guard_state)}"
+        )
+
+    action = compute_no_op_action(robot)
+    action[robot.arm_action_idx[arm]] = th.tensor(result.joint_positions, dtype=action.dtype)
+    set_gripper_action(robot, action, arm, gripper_command)
+    robot.apply_action(action)
+    og.sim.step()
+
+    if keep_arm_links_behind_gripper:
+        guard_is_active = update_arm_link_guard_state(
+            robot=robot,
+            arm=arm,
+            margin=args.arm_link_behind_gripper_margin,
+            activation_steps=args.arm_link_guard_activation_steps,
+            guard_state=arm_link_guard_state,
+        )
+        if guard_is_active:
+            link_violations = arm_links_ahead_of_gripper(robot, arm, args.arm_link_behind_gripper_margin)
+            if link_violations:
+                robot.set_joint_positions(previous_joint_positions, drive=False)
+                robot.set_joint_velocities(previous_joint_velocities, drive=False)
+                og.sim.step()
+                return result.requested_distance, [], link_violations
+
+    contact_paths = get_end_effector_contacts(robot, arm) if check_contacts else []
+    return result.requested_distance, contact_paths, []
+
+
 def step_toward(
     robot,
     arm,
@@ -493,23 +582,39 @@ def drive_to_waypoint(
     use_arm_link_guard=True,
     arm_link_guard_state=None,
 ):
+    optimizer = OptimizedIKSolver(optimized_ik_config_from_args(args)) if args.ik_solver == "optimized" else None
     for _ in range(args.max_steps_per_waypoint):
         if key_handler is not None and key_handler.reset_requested:
             return "reset", []
-        distance, contact_paths, link_violations = step_toward(
-            robot=robot,
-            arm=arm,
-            target_robot=waypoint,
-            max_delta=args.max_delta,
-            gripper_command=gripper_command,
-            target_orientation_robot=target_orientation_robot,
-            check_contacts=stop_on_contact,
-            keep_arm_links_behind_gripper=args.keep_arm_links_behind_gripper and use_arm_link_guard,
-            arm_link_behind_gripper_margin=args.arm_link_behind_gripper_margin,
-            arm_link_guard_activation_steps=args.arm_link_guard_activation_steps,
-            arm_link_guard_state=arm_link_guard_state,
-            target_is_tcp=target_is_tcp,
-        )
+        if args.ik_solver == "optimized":
+            if not target_is_tcp:
+                raise ValueError("Optimized IK waypoint driving only supports gripper TCP targets.")
+            distance, contact_paths, link_violations = apply_optimized_ik_step(
+                robot=robot,
+                arm=arm,
+                waypoint=waypoint,
+                args=args,
+                optimizer=optimizer,
+                gripper_command=gripper_command,
+                check_contacts=stop_on_contact,
+                keep_arm_links_behind_gripper=args.keep_arm_links_behind_gripper and use_arm_link_guard,
+                arm_link_guard_state=arm_link_guard_state,
+            )
+        else:
+            distance, contact_paths, link_violations = step_toward(
+                robot=robot,
+                arm=arm,
+                target_robot=waypoint,
+                max_delta=args.max_delta,
+                gripper_command=gripper_command,
+                target_orientation_robot=target_orientation_robot,
+                check_contacts=stop_on_contact,
+                keep_arm_links_behind_gripper=args.keep_arm_links_behind_gripper and use_arm_link_guard,
+                arm_link_behind_gripper_margin=args.arm_link_behind_gripper_margin,
+                arm_link_guard_activation_steps=args.arm_link_guard_activation_steps,
+                arm_link_guard_state=arm_link_guard_state,
+                target_is_tcp=target_is_tcp,
+            )
         if link_violations:
             return "link_ahead", link_violations
         if stop_on_contact and contact_paths:
@@ -702,8 +807,35 @@ def execute_prediction(robot, arm, prediction, trajectory_robot, args, key_handl
     return "finished"
 
 
-def reset_arm_to_home(robot, arm, home_position_robot, home_orientation_robot, args):
+def command_home_arm_joint_positions(robot, arm, home_arm_joint_positions, args):
+    target = th.tensor(home_arm_joint_positions, dtype=th.float32)
+    arm_control_idx = robot.arm_control_idx[arm]
+    for _ in range(args.max_steps_per_waypoint):
+        action = compute_no_op_action(robot)
+        action[robot.arm_action_idx[arm]] = target.to(dtype=action.dtype)
+        set_gripper_action(robot, action, arm, args.open_gripper_command)
+        robot.apply_action(action)
+        og.sim.step()
+        current = robot.get_joint_positions()[arm_control_idx]
+        if th.norm(current - target.to(dtype=current.dtype, device=current.device)).item() <= args.position_tolerance:
+            return True
+    return False
+
+
+def reset_arm_to_home(robot, arm, home_position_robot, home_orientation_robot, home_arm_joint_positions, args):
     print("Resetting arm to captured home position.")
+    if args.ik_solver == "optimized":
+        if command_home_arm_joint_positions(
+            robot=robot,
+            arm=arm,
+            home_arm_joint_positions=home_arm_joint_positions,
+            args=args,
+        ):
+            print("Arm reset finished.")
+        else:
+            print("Warning: arm reset did not reach captured home joint positions within the step budget.")
+        return
+
     status, _ = drive_to_waypoint(
         robot=robot,
         arm=arm,
@@ -720,12 +852,13 @@ def reset_arm_to_home(robot, arm, home_position_robot, home_orientation_robot, a
         print("Warning: arm reset did not reach home position within the step budget.")
 
 
-def run_arm_reset(robot, arm, home_position_robot, home_orientation_robot, args):
+def run_arm_reset(robot, arm, home_position_robot, home_orientation_robot, home_arm_joint_positions, args):
     reset_arm_to_home(
         robot=robot,
         arm=arm,
         home_position_robot=home_position_robot,
         home_orientation_robot=home_orientation_robot,
+        home_arm_joint_positions=home_arm_joint_positions,
         args=args,
     )
     print("Ready for another prediction after arm reset.")
@@ -763,11 +896,17 @@ def main():
         default="opencv",
         help="Frame convention used by prediction 3D points.",
     )
+    parser.add_argument(
+        "--ik-solver",
+        choices=("optimized", "omnigibson"),
+        default="optimized",
+        help="IK backend for prediction actuation.",
+    )
     parser.add_argument("--max-delta", type=float, default=0.025, help="Max IK delta command per sim step in meters.")
     parser.add_argument(
         "--position-tolerance",
         type=float,
-        default=0.015,
+        default=0.035,
         help="Waypoint tolerance in robot-frame meters.",
     )
     parser.add_argument("--max-steps-per-waypoint", type=int, default=80)
@@ -821,14 +960,27 @@ def main():
         default=None,
         help="Optional gripper command, e.g. -1.0.",
     )
+    parser.add_argument("--opt-ik-max-nfev", type=int, default=80, help="Max function evaluations per optimized IK step.")
+    parser.add_argument(
+        "--opt-ik-max-joint-delta",
+        type=float,
+        default=0.20,
+        help="Local optimized IK joint search radius per step, in radians / meters.",
+    )
+    parser.add_argument("--opt-ik-debug", action="store_true", help="Print optimized IK diagnostics each step.")
     args = parser.parse_args()
 
+    if args.ik_solver == "optimized" and not scipy_available():
+        raise ImportError("SciPy is required for --ik-solver optimized; rerun with --ik-solver omnigibson.")
+
+    args.capture_dir = resolve_capture_dir(args.capture_dir)
     metadata = load_metadata(args.capture_dir)
     predictions = load_predictions(args.capture_dir)
     _env, robot = build_environment(
         metadata=metadata,
         scene_model=args.scene_model,
         empty_scene=args.empty_scene,
+        ik_solver=args.ik_solver,
     )
     restore_robot_state(robot, metadata)
 
@@ -843,6 +995,7 @@ def main():
     home_eef_pose = metadata["robot"]["eef_poses"][arm]["robot_relative"]
     home_position_robot = np.asarray(home_eef_pose["position"], dtype=np.float32)
     home_orientation_robot = quat_to_axisangle(home_eef_pose["orientation_xyzw"])
+    home_arm_joint_positions = tensor_to_numpy(robot.get_joint_positions()[robot.arm_control_idx[arm]]).copy()
     trajectories_robot = {
         prediction.index: prediction_to_robot_trajectory(prediction, metadata, args.camera_frame)
         for prediction in predictions
@@ -857,7 +1010,14 @@ def main():
                 key_handler.reset_requested = False
                 key_handler.pending_index = None
                 try:
-                    run_arm_reset(robot, arm, home_position_robot, home_orientation_robot, args)
+                    run_arm_reset(
+                        robot,
+                        arm,
+                        home_position_robot,
+                        home_orientation_robot,
+                        home_arm_joint_positions,
+                        args,
+                    )
                 except Exception:
                     print("Failed to reset arm; simulator remains open.")
                     traceback.print_exc()
@@ -878,7 +1038,14 @@ def main():
                     if result == "reset":
                         key_handler.reset_requested = False
                         key_handler.pending_index = None
-                        run_arm_reset(robot, arm, home_position_robot, home_orientation_robot, args)
+                        run_arm_reset(
+                            robot,
+                            arm,
+                            home_position_robot,
+                            home_orientation_robot,
+                            home_arm_joint_positions,
+                            args,
+                        )
                     else:
                         print(f"Ready for another prediction after e{prediction.index}.")
                 except Exception:
