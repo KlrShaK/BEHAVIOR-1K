@@ -627,6 +627,7 @@ def drive_to_waypoint(
 
 
 def execute_prediction(robot, arm, prediction, trajectory_robot, args, key_handler=None):
+    trajectory_robot = np.array(trajectory_robot, dtype=np.float32, copy=True)
     print(
         f"Started e{prediction.index}: {prediction.path.name} "
         f"(candidate {prediction.best_candidate}, loss {prediction.best_loss:.4f})"
@@ -664,6 +665,13 @@ def execute_prediction(robot, arm, prediction, trajectory_robot, args, key_handl
                 f"{format_contact_paths(contact_paths)}."
             )
             print("Stage: contact checks disabled after approach; contact is expected during drawer actuation.")
+            contact_position = current_gripper_tcp_position(robot, arm)
+            trajectory_shift = contact_position - first_waypoint
+            trajectory_robot += trajectory_shift
+            print(
+                f"Stage: shifted prediction trajectory by contact offset "
+                f"dx={trajectory_shift[0]:.3f}, dy={trajectory_shift[1]:.3f}, dz={trajectory_shift[2]:.3f} m."
+            )
         elif status == "link_ahead":
             print(
                 "Warning: stopped moving to first waypoint because an arm link moved ahead of the gripper TCP: "
