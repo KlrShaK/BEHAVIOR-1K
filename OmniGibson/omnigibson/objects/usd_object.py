@@ -477,7 +477,7 @@ class USDObject(EntityPrim, Registerable, metaclass=ABCMeta):
         # If there is a file hash already in the init info, compare against it to see if the file has changed
         if self._expected_file_hash is not None:
             if file_hash != self._expected_file_hash:
-                log.warn(
+                log.debug(
                     f"Object {self.name} was expected to have USD file hash {self._expected_file_hash} but loaded with {file_hash}. The saved state might be incompatible."
                 )
         else:
@@ -1116,8 +1116,11 @@ class USDObject(EntityPrim, Registerable, metaclass=ABCMeta):
 
         # Iterate over all states and deserialize their states if they're stateful
         non_kin_state_dic = dict()
+        recorded_non_kin_state_names = getattr(self, "_recorded_non_kin_state_names", None)
         for state_type, state_instance in self._states.items():
             state_name = get_state_name(state_type)
+            if recorded_non_kin_state_names is not None and state_name not in recorded_non_kin_state_names:
+                continue
             if state_instance.stateful:
                 non_kin_state_dic[state_name], deserialized_items = state_instance.deserialize(state[idx:])
                 idx += deserialized_items

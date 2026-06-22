@@ -10,7 +10,7 @@ import torch as th
 import yaml
 from typing import Optional
 from omnigibson.envs import DataPlaybackWrapper
-from omnigibson.learning.utils.obs_utils import create_video_writer, write_video
+from omnigibson.eval.utils.obs_utils import create_video_writer, write_video
 from omnigibson.macros import gm
 from omnigibson.utils.config_utils import TorchEncoder
 
@@ -117,6 +117,10 @@ def select_episode_id(episode_lengths, default_episode_id, prompt_user=False):
     """
     Selects which episode to replay, optionally prompting the user.
     """
+    if len(episode_lengths) == 1:
+        print(f"Only one episode found, auto-selecting episode {default_episode_id}.")
+        return default_episode_id
+
     if not prompt_user:
         return default_episode_id
 
@@ -221,7 +225,7 @@ def replay_hdf5_to_video(
             task_misc_csv = csv.reader(f, delimiter=",", quotechar='"')
             for row in task_misc_csv:
                 if task_name in row[1]:
-                    load_room_instances = row[2].strip().split("\n")
+                    load_room_instances = row[2].strip().splitlines()
                     break
     except FileNotFoundError as e:
         raise e

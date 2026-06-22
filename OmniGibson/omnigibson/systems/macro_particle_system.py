@@ -950,7 +950,9 @@ class MacroVisualParticleSystem(MacroParticleSystem, VisualParticleSystem):
         # Sanity check the common groups, we will recreate any where there is a mismatch
         for name in common_groups:
             info = name_to_info_mapping[name]
-            if self.num_group_particles(group=name) != info["n_particles"]:
+            current_idns = {self.particle_name2idn(p_name) for p_name in self._group_particles[name]}
+            desired_idns = {int(idn) for idn in info["particle_idns"]}
+            if current_idns != desired_idns:
                 log.debug(f"Got mismatch in particle group {name} when syncing, deleting and recreating group now.")
                 # Add this group to both the delete and creation pile
                 groups_to_delete.append(name)
@@ -1261,6 +1263,9 @@ class MacroPhysicalParticleSystem(MacroParticleSystem, PhysicalParticleSystem):
 
         This is called through og.sim.update_handles when the physx object count etc. changes.
         """
+        if not og.sim.is_playing() or og.sim.physics_sim_view is None:
+            self.particles_view = None
+            return
         with suppress_omni_log(channels=["omni.physx.tensors.plugin"]):
             self.particles_view = og.sim.physics_sim_view.create_rigid_body_view(
                 pattern=f"{self.prim_path}/particles/*"
